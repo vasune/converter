@@ -7,24 +7,35 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/joho/godotenv"
 )
 
 type ExchangeRates struct {
-	Result string             `json:"result"`
-	Error  string             `json:"error-type"`
-	Code   string             `json:"base_code"`
-	Time   string             `json:"time_next_update_utc"`
-	Rates  map[string]float64 `json:"conversion_rates"`
+	TimeNextUpdate string             `json:"time_next_update_utc"`
+	Rates          map[string]float64 `json:"conversion_rates"`
+	Expire         time.Time
+}
+
+type CachedRates struct {
+	sync.RWMutex
+	Data map[string]*ExchangeRates
+}
+
+var cache = CachedRates{
+	Data: make(map[string]*ExchangeRates),
 }
 
 func main() {
-	fromCurrency, toCurrency, amount := getInput()
-	apiKey := getAPI()
-	rates := getRates(apiKey, fromCurrency)
-	currencyCheck(rates, toCurrency)
-	convertPrint(fromCurrency, toCurrency, rates.Rates[toCurrency], amount)
+	for {
+		fromCurrency, toCurrency, amount := getInput()
+		apiKey := getAPI()
+		rates := getRates(apiKey, fromCurrency)
+		currencyCheck(rates, toCurrency)
+		convertPrint(fromCurrency, toCurrency, rates.Rates[toCurrency], amount)
+	}
 }
 
 // Считывание данных
@@ -74,8 +85,19 @@ func getAPI() string {
 	return apiKey
 }
 
-// Получение курса
+// Получение курса с кэшированием
 func getRates(apiKey string, fromCurrency string) *ExchangeRates {
+	cache.RLock()
+	cacheFromCurrency, ok := cache.Data[fromCurrency]
+	cache.RUnlock()
+
+	if ok {
+		if time.Now().UTC().Before(cacheFromCurrency.Expire) {
+			fmt.Println("Данные считаны из кэша")
+			return cacheFromCurrency
+		}
+	}
+
 	exchangeUrl := fmt.Sprintf("https://v6.exchangerate-api.com/v6/%s/latest/%s", apiKey, fromCurrency)
 
 	exchangeResp, err := http.Get(exchangeUrl)
@@ -84,6 +106,11 @@ func getRates(apiKey string, fromCurrency string) *ExchangeRates {
 		os.Exit(1)
 	}
 	defer exchangeResp.Body.Close()
+
+	if exchangeResp.StatusCode != http.StatusOK {
+		fmt.Println("Ошибка HTTP запроса")
+		os.Exit(1)
+	}
 
 	exchangeBody, err := io.ReadAll(exchangeResp.Body)
 	if err != nil {
@@ -98,17 +125,23 @@ func getRates(apiKey string, fromCurrency string) *ExchangeRates {
 		os.Exit(1)
 	}
 
-	if rates.Result != "success" {
-		fmt.Println("Ошибка API запроса:", rates.Error)
-		os.Exit(1)
-	}
-
 	if rates.Rates == nil {
 		fmt.Println("Ошибка: неверный API-ключ или некорректный ответ от сервера")
 		os.Exit(1)
 	}
 
-	return &rates
+	expireTime, err := time.Parse(time.RFC1123Z, rates.TimeNextUpdate)
+	if err != nil {
+		fmt.Println("Ошибка парсинга времени:", err)
+	} else {
+		rates.Expire = expireTime
+		cache.Lock()
+		defer cache.Unlock()
+		cache.Data[fromCurrency] = &rates
+		fmt.Println("Данные закэшированы")
+	}
+
+	return cache.Data[fromCurrency]
 }
 
 // Проверка наличия валюты в мапе
@@ -123,5 +156,5 @@ func currencyCheck(rates *ExchangeRates, toCurrency string) {
 // Конвертация и вывод
 func convertPrint(from string, to string, rate float64, amount float64) {
 	result := amount * rate
-	fmt.Printf("%.2f %s = %.2f %s", amount, from, result, to)
+	fmt.Printf("%.2f %s = %.2f %s\n", amount, from, result, to)
 }
